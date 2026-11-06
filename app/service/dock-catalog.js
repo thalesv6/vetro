@@ -1,4 +1,14 @@
 'use strict';
+// Regular expressions compiled once at module load, not on every call.
+var HEX_RE = /^(?:[a-fA-F0-9]{2})*$/;
+var CR_END_RE = /\r$/;
+var SOURCE_ID_RE = /^[sd]\/[A-Za-z0-9_]+@\S+$/;
+var NON_ALNUM_RE = /[^a-z0-9]+/g;
+var EDGE_DASHES_RE = /^-+|-+$/g;
+var LABEL_CONTROL_RE = /[\u0000-\u001f\u007f|]/g;
+var LABEL_SPACES_RE = /\s+/g;
+var YOUTUBE_ICON_RE = /^youtube$/i;
+var TRAILING_TABS_RE = /\t+$/;
 // The dock's app list, built from what Samsung's own Home reads, so the two start out the same:
 //   - the Home row order       .../apps_rw/com.samsung.tv.csfs/data/.appLayerCache.1 (or .2); TVs with the new Home
 //                              (com.samsung.tv.home.media, 2022 and later) keep it in that package's data dir instead
@@ -39,6 +49,9 @@ var SYSTEM_ROWS = [
     'settings\tSettings\tkey:XF86SysMenu\torg.tizen.menu',
     'samsunghome\tSamsung Home\tsys:com.samsung.tv.csfs'
 ];
+// 2025 (CoBA) firmware: csfs is only the service; the Home that comes up on screen is started through this app,
+// which then spawns csfs, home.sidebar and home.media. When it is installed the pill starts it instead.
+var COBA_HOME = 'com.samsung.tv.coba.newhome';
 
 function script() {
     var sizes = '224x224 304x304 152x152 104x104 icon';
@@ -50,27 +63,28 @@ function script() {
         'for d in ' + ICON_ROOT + '*/; do id=$(basename "$d"); for s in ' + sizes + '; do',
         '  if [ -f "$d$s.png" ]; then echo "I|$id|$d$s.png"; break; fi; done; done',
         'sqlite3 -readonly /opt/dbspace/.pkgmgr_parser.db "SELECT \'P|\'||hex(a.app_id)||\'|\'||hex(l.app_icon) FROM package_app_info a JOIN package_app_localized_info l ON l.app_id=a.app_id WHERE l.app_icon != \'\';" 2>/dev/null',
+        '[ -d /usr/apps/' + COBA_HOME + ' ] || [ -d /opt/usr/apps/' + COBA_HOME + ' ] && echo "H|' + COBA_HOME + '"',
         'true'
     ].join('\n');
 }
 
 function wrap(s) { return 'echo ' + Buffer.from(s).toString('base64') + ' | base64 -d | sh'; }
 function unhex(v) {
-    if (!/^(?:[a-fA-F0-9]{2})*$/.test(v)) throw new Error('invalid registry field');
+    if (!HEX_RE.test(v)) throw new Error('invalid registry field');
     return Buffer.from(v, 'hex').toString('utf8');
 }
 
 // Splits the script's output into what each source said. Lines that do not parse are skipped:
 // one odd registry row must not leave the TV without a dock.
 function parse(text) {
-    var out = {order: [], registry: {}, icons: {}, packageIcons: {}};
+    var out = {order: [], registry: {}, icons: {}, packageIcons: {}, homeApp: null};
     String(text || '').split('\n').forEach(function (line) {
-        line = line.replace(/\r$/, '');
+        line = line.replace(CR_END_RE, '');
         var f = line.split('|');
         try {
             if (f[0] === 'O') {
                 var entry = f.slice(1).join('|').trim();
-                if (/^[sd]\/[A-Za-z0-9_]+@\S+$/.test(entry)) out.order.push(entry);
+                if (SOURCE_ID_RE.test(entry)) out.order.push(entry);
             } else if (f[0] === 'R' && f.length === 5) {
                 out.registry[unhex(f[1])] = {title: unhex(f[2]), appId: unhex(f[3]), hidden: f[4] === '1'};
             } else if (f[0] === 'I' && f.length === 3) {
@@ -78,6 +92,8 @@ function parse(text) {
             } else if (f[0] === 'P' && f.length === 3) {
                 var icon = unhex(f[2]), id = unhex(f[1]);
                 if (iconOk(icon) && !out.packageIcons[id]) out.packageIcons[id] = icon;
+            } else if (f[0] === 'H' && f.length === 2) {
+                if (f[1].trim() === COBA_HOME) out.homeApp = COBA_HOME;
             }
         } catch (e) { /* skip the line */ }
     });
@@ -85,12 +101,12 @@ function parse(text) {
 }
 
 function slugify(text) {
-    var s = String(text).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 36);
+    var s = String(text).toLowerCase().replace(NON_ALNUM_RE, '-').replace(EDGE_DASHES_RE, '').slice(0, 36);
     return s || 'app';
 }
 
 function cleanLabel(text, fallback) {
-    var s = String(text || '').replace(/[\u0000-\u001f\u007f|]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40).trim();
+    var s = String(text || '').replace(LABEL_CONTROL_RE, ' ').replace(LABEL_SPACES_RE, ' ').trim().slice(0, 40).trim();
     return s || fallback;
 }
 
@@ -100,7 +116,7 @@ function youtubeIcon(parsed) {
     var found = null;
     Object.keys(parsed.registry).forEach(function (id) {
         var r = parsed.registry[id];
-        if (!found && !r.hidden && /^youtube$/i.test(r.title.trim()) && !TIZENTUBE.test(r.appId) && parsed.icons[id]) found = parsed.icons[id];
+        if (!found && !r.hidden && YOUTUBE_ICON_RE.test(r.title.trim()) && !TIZENTUBE.test(r.appId) && parsed.icons[id]) found = parsed.icons[id];
     });
     return found;
 }
@@ -137,15 +153,19 @@ function build(parsed, options) {
             if (yt) entry.icon = yt; else skipped.push({item: entry.slug, reason: 'No YouTube icon found; the app\'s own icon is used'});
         }
     });
-    return {entries: entries, skipped: skipped};
+    return {entries: entries, skipped: skipped, homeApp: parsed.homeApp || null};
 }
 
 function tsv(built) {
     var lines = ['# written by Vetro from the TV\'s own Home row; do not edit, it is rebuilt every time the dock starts'];
     built.entries.forEach(function (e) {
-        lines.push([e.slug, e.label, e.appId, '', e.icon || '', e.killFirst || ''].join('\t').replace(/\t+$/, ''));
+        lines.push([e.slug, e.label, e.appId, '', e.icon || '', e.killFirst || ''].join('\t').replace(TRAILING_TABS_RE, ''));
     });
-    return lines.concat(SYSTEM_ROWS).join('\n') + '\n';
+    var system = SYSTEM_ROWS.map(function (row) {
+        // The CoBA home launcher first, Samsung's older home app as the fallback the dock already knows.
+        return built.homeApp ? row.replace('sys:com.samsung.tv.csfs', 'sys:' + built.homeApp + '\tcom.samsung.tv.csfs') : row;
+    });
+    return lines.concat(system).join('\n') + '\n';
 }
 
 // The registry can point at an icon that is no longer there (TV Plus does). One more read-only

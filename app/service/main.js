@@ -6,7 +6,10 @@ require('./compat.js').install();
 var fs = require('fs');
 var http = require('http');
 var os = require('os');
+var path = require('path');
 var MqttBridge = require('./mqtt-bridge.js').MqttBridge;
+var PluginHost = require('./plugin-host.js').PluginHost;
+var Updater = require('./updater.js').Updater;
 var debloat = require('./debloat.js');
 var control = require('./control.js');
 var packageInfo = require('./package-info.js');
@@ -21,6 +24,27 @@ var AppRegistry = require('./app-registry.js');
 var PhysicalInput = require('./physical-input.js').Bridge;
 var renderDashboard = require('./dashboard.js');
 var SystemMonitor = require('./system-monitor.js').Monitor;
+// Regular expressions compiled once at module load, not on every call.
+var WHITESPACE_RE = /\s+/;
+var PROCESSOR_LINE_RE = /^processor/mg;
+var CPU_TOTAL_LINE_RE = /^cpu /;
+var CPU_CORE_LINE_RE = /^cpu[0-9]/;
+var THERMAL_ZONE_RE = /^thermal_zone\d+$/;
+var THERMAL_DEVICE_RE = /thermal$/;
+var APP_ID_RE = /^[A-Za-z0-9_.-]+$/;
+var DIAGNOSTICS_QUERY_RE = /(?:\?|&)diagnostics=1(?:&|$)/;
+var REFRESH_QUERY_RE = /refresh=1/;
+var APP_ID_QUERY_RE = /[?&]appId=([^&#]*)/;
+var PLUS_RE = /\+/g;
+var APP_ID_120_RE = /^[A-Za-z0-9_.-]{1,120}$/;
+var WHITESPACE_CHAR_RE = /\s/g;
+var FORMAT_QUERY_RE = /(?:^|&)format=(hosts|domains)(?:&|$)/;
+var KEY_CAPABILITY_RE = /[1-9a-f]/i;
+var PLUGIN_SESSION_API_RE = /^\/plugins\/[^\/]+\/s\/[0-9a-f]{32}\/api(?:\/|$)/;
+var COMPONENTS_QUERY_RE = /(?:\?|&)components=1(?:&|$)/;
+var MENU_ID_QUERY_RE = /[?&]id=([^&]+)/;
+var SCOPE_QUERY_RE = /[?&]scope=([^&]*)/;
+var MONITOR_SCOPE_RE = /^(summary|full)$/;
 var monitor = new SystemMonitor(agentExecute);
 var ComponentActions = require('./component-actions.js');
 var dnsFilter = new (require('./local-dns.js').Filter)(agentExecute);
@@ -28,12 +52,13 @@ var homeOrder = new (require('./home-order.js').Order)(agentExecute);
 var dock = new (require('./dock.js').Dock)({execute: agentExecute});
 var arcFix = new (require('./arc-fix.js').ArcFix)({execute: agentExecute});
 var hbbtv = new (require('./hbbtv.js').Control)(agentExecute);
-var wins = new (require('./quick-wins.js').Wins)(agentExecute);
+var wins = new (require('./quick-wins.js').Wins)(agentExecute, {dns: dnsFilter});
 var presence = new (require('./presence.js').Presence)(agentExecute);
 var tvState = new (require('./tv-state.js').Store)(agentExecute);
 var privacy = new (require('./privacy.js').Privacy)(agentExecute);
 var menuSettings = new (require('./menu-settings.js').Catalog)(agentExecute);
 var quickSettings = require('./quick-settings.js');
+var disabledLedger = require('./disabled-ledger.js');
 var leftovers = new (require('./leftovers.js').Leftovers)(agentExecute);
 // Components whose disabled flag Vetro may change: verified ACR set plus Quick Settings groups.
 var TOGGLE_IDS = debloat.VERIFIED_GLOBAL_IDS.concat(quickSettings.ALLOWED_IDS);
@@ -60,11 +85,11 @@ function readTelemetry() {
     };
 
     var up = tryRead('/proc/uptime');
-    if (up) out.uptime_s = parseFloat(up.split(/\s+/)[0]);
+    if (up) out.uptime_s = parseFloat(up.split(WHITESPACE_RE)[0]);
     else out.uptime_s = null;
 
     var cpuinfo = tryReadRaw('/proc/cpuinfo');
-    if (cpuinfo) out.cpu_cores = (cpuinfo.match(/^processor/mg) || []).length;
+    if (cpuinfo) out.cpu_cores = (cpuinfo.match(PROCESSOR_LINE_RE) || []).length;
     else out.cpu_cores = null;
 
     var freq = tryRead('/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq');
@@ -77,8 +102,8 @@ function readTelemetry() {
 
     var stat = tryReadRaw('/proc/stat');
     if (stat) {
-        out.cpu_stat = (stat.split('\n').filter(function (l) { return /^cpu /.test(l); })[0] || '').trim();
-        out.cpu_percpu = stat.split('\n').filter(function (l) { return /^cpu[0-9]/.test(l); }).join(';');
+        out.cpu_stat = (stat.split('\n').filter(function (l) { return CPU_TOTAL_LINE_RE.test(l); })[0] || '').trim();
+        out.cpu_percpu = stat.split('\n').filter(function (l) { return CPU_CORE_LINE_RE.test(l); }).join(';');
     } else {
         out.cpu_stat = null;
         out.cpu_percpu = null;
@@ -88,14 +113,14 @@ function readTelemetry() {
     ['/sys/class/thermal', '/sys/devices/virtual/thermal'].forEach(function (dir) {
         if (temp) return;
         var zones = [];
-        try { zones = fs.readdirSync(dir).filter(function (n) { return /^thermal_zone\d+$/.test(n); }).sort(); } catch (e) { zones = []; }
+        try { zones = fs.readdirSync(dir).filter(function (n) { return THERMAL_ZONE_RE.test(n); }).sort(); } catch (e) { zones = []; }
         zones.forEach(function (zone) { if (!temp) temp = tryRead(dir + '/' + zone + '/temp'); });
     });
     // Samsung's TVs have no Linux thermal zones (nothing under /sys/class/thermal): the SoC driver exposes the
     // temperature in whole degrees, as <soc>/<name>.thermal/temperature (56 on a Q80A), readable by everyone.
     if (!temp) {
         var soc = '/sys/devices/platform/soc', names = [];
-        try { names = fs.readdirSync(soc).filter(function (n) { return /thermal$/.test(n); }).sort(); } catch (e) { names = []; }
+        try { names = fs.readdirSync(soc).filter(function (n) { return THERMAL_DEVICE_RE.test(n); }).sort(); } catch (e) { names = []; }
         names.forEach(function (n) { if (!temp) temp = tryRead(soc + '/' + n + '/temperature'); });
     }
     if (temp) { var t = parseInt(temp, 10); out.soctemp_c = (t > 1000) ? (t / 1000) : t; }
@@ -130,15 +155,24 @@ function serveHtml(res, html) {
 
 function dashboardHtml() { return renderDashboard(); }
 
-var diagnosticPending = null;
-function downloadDiagnostics(res) {
+var diagnosticPending = null, diagnosticComponents = false;
+function downloadDiagnostics(res, withComponents) {
     // The CPU rate needs a second sample 1.5 s after the first, and the TV runs its commands one after the other:
     // read together, the sample waited behind the 13 s startup listing and came back without a rate (4 of 7 reports).
     // The other reads start once the second sample is queued, so it runs right after the first.
     function later(fn) { return function () { return new Promise(function (r) { setTimeout(r, 1700); }).then(fn); }; }
+    withComponents = withComponents === true;
+    // A plain download never joins one that is already reading the manifests, and the other way round.
+    if (diagnosticPending && diagnosticComponents !== withComponents) return diagnosticPending.then(function () { return downloadDiagnostics(res, withComponents); }, function () { return downloadDiagnostics(res, withComponents); });
+    diagnosticComponents = withComponents;
     if (!diagnosticPending) diagnosticPending = require('./diagnostic-report.js').collect({
         platform: function () { return platform.status(); },
-        device: function () { return Object.assign({}, state.settings || {}, {receivedAt: state.receivedAt}); },
+        // The widget's probe wins. The service adds the firmware and Tizen version it reads itself; that read starts at once
+        // (a few milliseconds, ahead of the slow ones) and gives up after 8 s, so it can only add to the probe.
+        device: function () {
+            var info = require('./device-info.js');
+            return info.merge(Object.assign({}, state.settings || {}, {receivedAt: state.receivedAt}), agentExecute, 8000, info.httpGet);
+        },
         inventory: later(function () { return inventory(false); }),
         settings: later(function () { return tvSettings.read(); }),
         catalog: later(function () { return menuSettings.load(); }),
@@ -152,6 +186,10 @@ function downloadDiagnostics(res) {
         // The collector treats a truthy "error" as an unreadable section; the launcher keeps its last error there.
         launcher: later(function () { return dock.status().then(function (d) { return Object.assign({}, d, {error: null, hasError: !!d.error}); }); }),
         quickWins: later(function () { return wins.read(); }),
+        // Opt-in: the manifests of the components the catalog does not know. Without the box ticked the section says so.
+        components: withComponents
+            ? later(function () { return inventory(false).then(function (inv) { return require('./component-facts.js').read(agentExecute, inv.apps); }); })
+            : function () { throw require('./exec-error.js').coded('not-requested', 'not requested'); },
         probe: function () { return state; },
         serviceApis: serviceApiProbe
     }).finally(function () { diagnosticPending = null; });
@@ -180,6 +218,20 @@ function handleInstall(req, res) {
             serveJson(res, {submitted: false, error: String(error.message || error)}, 400);
         });
     });
+}
+
+// --- self-update ------------------------------------------------------------
+// The bundle is a signed text file (about 1.5 MB). It is checked here against the key built into the package.
+function handleUpdate(req, res, apply) {
+    readBody(req, function (body, err) {
+        if (err) return serveJson(res, {ok: false, error: err.message}, err.statusCode || 400);
+        var sha = req.headers && req.headers['x-vetro-sha256'];
+        var task;
+        try { task = apply ? updater.apply(body, sha) : Promise.resolve(updater.check(body, sha)); } catch (e) { task = Promise.reject(e); }
+        task.then(function (d) { serveJson(res, d); }, function (e) {
+            serveJson(res, {ok: false, error: e.message, code: e.code || null}, e.code === 'busy' ? 409 : 400);
+        });
+    }, 8 * 1024 * 1024);
 }
 
 function readBody(req, cb, maxBytes) {
@@ -327,7 +379,7 @@ function handleDebloatAction(req, res) {
         var kind = parsed.kind || 'ads';     // "ads" | "privacy"
         var appIds = parsed.appIds;          // optional explicit list
         if (appIds != null && (!Array.isArray(appIds) || appIds.some(function (id) {
-            return typeof id !== 'string' || !/^[A-Za-z0-9_.-]+$/.test(id);
+            return typeof id !== 'string' || !APP_ID_RE.test(id);
         }))) {
             return serveJson(res, { error: 'appIds must be an array of application IDs' }, 400);
         }
@@ -348,6 +400,11 @@ function handleDebloatAction(req, res) {
         var id=appIds[0],desired=action==='disable',original;
         inventory(true).then(function(d){var row=d.apps.find(function(a){return a.appId===id;});if(d.registryError)throw Error('App registry unavailable');if(!row){var missing=Error('App not installed');missing.statusCode=409;throw missing;}var capability=ComponentActions.availability(row,d.apps,TOGGLE_IDS).toggle;if(!capability.allowed){var unavailable=Error(capability.reason);unavailable.statusCode=409;throw unavailable;}original=row.disabled;if(original===desired)return {ok:true,verified:true,changed:false,appId:id,disabled:desired};
             return agentExecute('pkgcmd '+(desired?'-D':'-A')+' -t app -n '+id+' --global',15000).then(function(r){if(r.exit_code||r.timed_out)throw Error(r.stderr||r.stdout||'App state unchanged');registryAt=0;return inventory(true);}).then(function(after){var r=after.apps.find(function(a){return a.appId===id;});if(after.registryError||!r||r.disabled!==desired)throw Error('Global flag not confirmed');return {ok:true,verified:true,changed:true,appId:id,disabled:r.disabled,scope:'Global flag confirmed; running processes may remain until the next launch'};}).catch(function(e){return agentExecute('pkgcmd '+(original?'-D':'-A')+' -t app -n '+id+' --global',15000).then(function(r){if(r.exit_code||r.timed_out)throw Error('Restore not confirmed');registryAt=0;return inventory(true);}).then(function(d){var restored=d.apps.find(function(a){return a.appId===id;});throw Error(e.message+' · '+(restored&&restored.disabled===original&&!d.registryError?'previous flag restored':'restore not confirmed'));},function(){throw Error(e.message+' · restore not confirmed');});});
+        }).then(function(d){
+            // Remember what Vetro disabled, so that "Restore the TV" switches on those and not what the firmware ships disabled.
+            if(d.changed===false&&desired)return d;
+            var ledger;try{ledger=desired?disabledLedger.addCommand(id):disabledLedger.removeCommand(id);}catch(e){return d;}
+            return agentExecute(ledger,8000).then(function(){return d;},function(){return d;});
         }).then(function(d){debloatBusy=false;serveJson(res,d);}).catch(function(e){debloatBusy=false;serveJson(res,{ok:false,error:e.message},e.statusCode||503);});
 
     });
@@ -379,7 +436,7 @@ function saveRemap() {
 
 function handleProbe(req, res) {
     if (req.method === 'GET') {
-        if (/(?:\?|&)diagnostics=1(?:&|$)/.test(req.url || '')) {
+        if (DIAGNOSTICS_QUERY_RE.test(req.url || '')) {
             return serveJson(res, {report: state, service: serviceApiProbe()});
         }
         return serveJson(res, state);
@@ -390,7 +447,7 @@ function handleProbe(req, res) {
         return serveJson(res, { error: 'Probe reports are accepted from the TV only' }, 403);
     }
     readJsonBody(req, res, function (parsed) {
-        try { state = probe.sanitize(parsed); }
+        try { state = probe.carry(state, probe.sanitize(parsed)); }
         catch (e) { return serveJson(res, { error: String(e.message || e) }, 400); }
         serveJson(res, { ok: true, persisted: probe.save(state) });
     }, probe.MAX_JSON);
@@ -437,6 +494,28 @@ function handleWins(req,res) {readJsonBody(req,res,function(p){
     if(debloatBusy)return serveJson(res,{ok:false,error:'App change already in progress'},409);debloatBusy=true;
     wins.apply(p.id,p.on).then(function(d){debloatBusy=false;serveJson(res,d);}).catch(function(e){debloatBusy=false;serveJson(res,{ok:false,error:e.message},409);});
 });}
+// Restore the TV: puts back what Vetro changed, then (separately) removes Vetro's data. See restore.js.
+var restoreTv = new (require('./restore.js').Restore)({
+    execute: agentExecute, inventory: inventory, invalidate: function(){registryAt=0;},
+    wins: wins, hbbtv: hbbtv, dns: dnsFilter, homeOrder: homeOrder, dock: dock,
+    plugins: {list: function(){return plugins.list();}, setEnabled: function(id,on){return plugins.setEnabled(id,on);}},
+    input: {active: function(){return inputPreference().enabled===true||inputObservers.length>0;},
+        off: function(){stopInput();inputPaused=false;saveInputPreference({enabled:false});}},
+    mqtt: {enabled: function(){var c=require('./mqtt-bridge.js').readConfig();return !!c&&c.enabled!==false&&!!c.host;},
+        off: function(){var m=require('./mqtt-bridge.js'),c=Object.assign({},m.readConfig(),{enabled:false});m.saveConfig(c);bridge.configure(c);}},
+    afterHbbtv: function(){privacy.cached=null;},
+    removeAuth: function(){try{fs.unlinkSync(auth.STORE_PATH);}catch(e){}}
+});
+function handleRestore(req,res) {
+    if(req.method==='GET')return restoreTv.publicPlan().then(function(d){serveJson(res,d);}).catch(function(e){serveJson(res,{ok:false,error:e.message},503);});
+    readJsonBody(req,res,function(p){
+        if(p.action!=='run'&&p.action!=='erase')return serveJson(res,{error:'Invalid restore action'},400);
+        if(debloatBusy)return serveJson(res,{ok:false,error:'App change already in progress'},409);debloatBusy=true;
+        if(p.action==='run')return restoreTv.run().then(function(d){debloatBusy=false;serveJson(res,d);}).catch(function(e){debloatBusy=false;serveJson(res,{ok:false,error:e.message},503);});
+        restoreTv.eraseData().then(function(d){debloatBusy=false;var finish=d.finish;delete d.finish;res.on('finish',finish);serveJson(res,d);})
+            .catch(function(e){debloatBusy=false;serveJson(res,{ok:false,error:e.message},e.statusCode||503);});
+    });
+}
 // Vetro's own app icon, shown in the dashboard. It ships in the package next to the service folder.
 var iconPng=null;
 function serveIcon(res) {
@@ -455,16 +534,22 @@ function handleLeftovers(req,res) {
         leftovers.clear().then(function(d){serveJson(res,d);}).catch(function(e){serveJson(res,{ok:false,error:e.message},503);});
     });
 }
-function handleApps(req,res) {inventory(/refresh=1/.test(req.url)).then(function(data){serveJson(res,data);});}
+function handleApps(req,res) {inventory(REFRESH_QUERY_RE.test(req.url)).then(function(data){serveJson(res,data);});}
 var iconCache = {};
+// ?appId=... read straight from the query string: the one parameter does not need a URL parser.
+function appIdOf(rawUrl) {
+    var m = APP_ID_QUERY_RE.exec(rawUrl || '');
+    if (!m) return undefined;
+    try { return decodeURIComponent(m[1].replace(PLUS_RE, ' ')); } catch (e) { return undefined; }
+}
 function handleIcon(req,res) {
-    var id=require('url').parse(req.url,true).query.appId;
-    if (!id || !/^[A-Za-z0-9_.-]{1,120}$/.test(id)) return serveJson(res,{error:'invalid appId'},400);
+    var id=appIdOf(req.url);
+    if (!id || !APP_ID_120_RE.test(id)) return serveJson(res,{error:'invalid appId'},400);
     function send(icon){res.writeHead(200,{'content-type':icon.mime,'cache-control':'private, max-age=3600','X-Content-Type-Options':'nosniff'});res.end(icon.data);}
     if(iconCache[id])return send(iconCache[id]);
     inventory(false).then(function(data){var row=data.apps.find(function(r){return r.appId===id;}), command=AppRegistry.iconCommand(row);
         if(!command)throw new Error('no readable icon');
-        return agentExecute(command,10000).then(function(r){if(r.exit_code||r.timed_out)throw new Error('icon unavailable');var data=Buffer.from(r.stdout.replace(/\s/g,''),'base64');
+        return agentExecute(command,10000).then(function(r){if(r.exit_code||r.timed_out)throw new Error('icon unavailable');var data=Buffer.from(r.stdout.replace(WHITESPACE_CHAR_RE,''),'base64');
             var png=data.slice(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])), jpg=data[0]===255&&data[1]===216;
             if((!png&&!jpg)||data.length>262144)throw new Error('unsupported icon');
             var icon={data:data,mime:png?'image/png':'image/jpeg'};if(Object.keys(iconCache).length<100)iconCache[id]=icon;send(icon);
@@ -472,14 +557,14 @@ function handleIcon(req,res) {
     }).catch(function(){serveJson(res,{error:'icon unavailable'},404);});
 }
 function handleLaunch(req,res) {readJsonBody(req,res,function(p){
-    if(typeof p.appId!=='string'||! /^[A-Za-z0-9_.-]{1,120}$/.test(p.appId))return serveJson(res,{error:'invalid appId'},400);
+    if(typeof p.appId!=='string'||! APP_ID_120_RE.test(p.appId))return serveJson(res,{error:'invalid appId'},400);
     inventory(false).then(function(data){if(!data.apps.some(function(r){return r.appId===p.appId;}))throw new Error('application not installed');return runActions([{type:'launch',appId:p.appId}]);})
         .then(function(r){serveJson(res,r);}).catch(function(e){serveJson(res,{error:e.message},503);});
 });}
 
 function handleBlocklist(req, res) {
     var q = (req.url || '').split('?')[1] || '';
-    var m = /(?:^|&)format=(hosts|domains)(?:&|$)/.exec(q);
+    var m = FORMAT_QUERY_RE.exec(q);
     var body = apps.blocklist(m ? m[1] : 'domains');
     res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
     res.end(body);
@@ -493,7 +578,7 @@ function handleRemap(req, res) {
     if (req.method === 'GET') return serveJson(res, { rules: remapStore.rules, paired: !!remapStore.token });
     readJsonBody(req, res, function (parsed) {
         var rules;
-        try { rules = remap.validateRules(parsed.rules); }
+        try { rules = remap.checkLaunchable(remap.validateRules(parsed.rules)); }
         catch (e) { return serveJson(res, { error: String(e.message || e) }, 400); }
         stopInput(); inputPaused=false;
         remapStore.rules = rules;
@@ -507,6 +592,7 @@ function runActions(actions) {
     return actions.reduce(function(chain,a){return chain.then(function(){
         var command;
         if(a.type==='mqtt'){bridge.publish(a.topic,a.payload);sent++;mqttSent++;return;}
+        if(a.type==='launch'&&!remap.launchable(a.appId)){skipped.push('launch:not-an-app');return;}
         if(a.type==='launch')command='/usr/bin/app_launcher -s '+a.appId;
         else if(a.type==='key'){var key=control.nativeKey(a.key);command=key&&control.injectCommand(key);if(!command)throw new Error('unsupported native key: '+a.key);}
         else {skipped.push(a.type);return;}
@@ -535,7 +621,7 @@ function restoreInput(){
     physical.inventory().then(function(list){
         if(inputPaused||inputPreference()!==preference)return;
         var candidates=list.filter(function(d){return d.selectable&&d.name===preference.device;});
-        var keyed=candidates.filter(function(d){try{return /[1-9a-f]/i.test(require('fs').readFileSync('/sys/class/input/'+d.node.split('/').pop()+'/device/capabilities/key','utf8'));}catch(e){return false;}});
+        var keyed=candidates.filter(function(d){try{return KEY_CAPABILITY_RE.test(require('fs').readFileSync('/sys/class/input/'+d.node.split('/').pop()+'/device/capabilities/key','utf8'));}catch(e){return false;}});
         // Several interfaces share the name: the one that advertises keys, and if more than one does, the saved node among them.
         var device=candidates.length===1?candidates[0]:keyed.length===1?keyed[0]:keyed.find(function(d){return d.node===preference.node;})||null;
         if(!device)throw new Error('Saved physical remote is unavailable');
@@ -581,11 +667,18 @@ function handleRemapRun(req,res){readJsonBody(req,res,function(p){
     runActions(remap.resolve(remapStore.rules,p.type,p.value,p.payload)).then(function(r){serveJson(res,r);}).catch(function(e){serveJson(res,{ok:false,error:e.message},503);});
 });}
 
+var auth = require('./auth.js');
+// The Vetro app polls /auth/pending and shows the code; open it so the code is on screen.
+function showPairingCode() { runActions([{type: 'launch', appId: 'vetrotvapp.app'}]).catch(function () {}); }
 http.createServer(function (req, res) {
     var url = (req.url || '/').split('?')[0];
+    // A sandboxed plugin page carries no sign-in cookie; its URL holds a session token the plugin host checks.
+    if (PLUGIN_SESSION_API_RE.test(url)) return plugins.handle(req, res, url, serveJson, readBody);
+    if (auth.gate(req, res, url, {open: platform.status().mode === 'app-only', onPair: showPairingCode})) return;
+    if (url === '/plugins' || url.indexOf('/plugins/') === 0) return plugins.handle(req, res, url, serveJson, readBody);
     if (url === '/diagnostics/download') {
         if (req.method !== 'GET') return serveJson(res, {error:'Use GET to download diagnostics'}, 405);
-        return downloadDiagnostics(res);
+        return downloadDiagnostics(res, COMPONENTS_QUERY_RE.test(req.url || ''));
     }
     // Packaged widget documents use an opaque (null) origin. Allow only its
     // probe/status exchange, including the JSON POST preflight.
@@ -605,8 +698,9 @@ http.createServer(function (req, res) {
         if (url === '/debloat') return handleDebloatAction(req, res);
         if (url === '/dns') return readJsonBody(req,res,function(p){var task=p.action==='observe'?dnsFilter.observe():p.action==='apply'?dnsFilter.apply(p.enabled,p.domains):Promise.reject(Error('Invalid filter action'));task.then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});});
         if (url === '/wins') return handleWins(req,res);
+        if (url === '/restore') return handleRestore(req,res);
         if (url === '/hbbtv') return readJsonBody(req,res,function(p){hbbtv.change(p.off,p.expected).then(function(d){privacy.cached=null;try{wins.remember('hbbtv',d.off);}catch(e){}serveJson(res,d);}).catch(function(e){serveJson(res,{error:e.message},409);});});
-        if (url === '/dock') return readJsonBody(req,res,function(p){var t=p.action==='enable'?dock.enable():p.action==='disable'?dock.disable():p.action==='refresh'?dock.refresh():p.action==='fixTizenTube'?dock.setFixTizenTube(p.on):Promise.reject(Error('Invalid dock action'));t.then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{ok:false,error:e.message},409)});});
+        if (url === '/dock') return plugins.dispatch('launcher', req, res, 'action', serveJson);
         if (url === '/arc-fix') return readJsonBody(req,res,function(p){var t=p.action==='enable'?arcFix.enable(p):p.action==='disable'?arcFix.disable():p.action==='configure'?arcFix.configure(p):p.action==='trigger'?arcFix.trigger(p):Promise.reject(Error('Invalid ARC action'));t.then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{ok:false,error:e.message},409)});});
         if (url === '/home-order') return readJsonBody(req,res,function(p){var t=p.action==='restore'?homeOrder.restore():homeOrder.write(p.entries);t.then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},409)});});
         if (url === '/tv-menu') return readJsonBody(req,res,function(p){menuSettings.write(p.id,p.value).then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{ok:false,error:e.message},409)});});
@@ -617,26 +711,30 @@ http.createServer(function (req, res) {
         if (url === '/mqtt') return handleMqttConfig(req, res);
         if (url === '/control') return handleControl(req, res);
         if (url === '/install') return handleInstall(req, res);
+        if (url === '/update/apply' || url === '/update/check') return handleUpdate(req, res, url === '/update/apply');
+        if (url === '/update/rollback') return updater.rollback().then(function (d) { serveJson(res, d); }, function (e) { serveJson(res, {ok: false, error: e.message}, 409); });
         if (url === '/probe') return handleProbe(req, res);
         if (url === '/remap') return handleRemap(req, res);
         if (url === '/remap/run') return handleRemapRun(req, res);
         return serveJson(res, { error: 'POST not supported here' }, 405);
     }
     if (url === '/dns') return dnsFilter.status().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
-    if (url === '/dock/icon') {var slug=require('url').parse(req.url,true).query.slug,png=dock.iconFile(slug);if(!png)return serveJson(res,{error:'icon unavailable'},404);res.writeHead(200,{'content-type':'image/png','cache-control':'private, max-age=60','X-Content-Type-Options':'nosniff'});return res.end(png);}
-    if (url === '/dock') return dock.status({preview: true}).then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
+    if (url === '/dock/icon') return plugins.dispatch('launcher', req, res, 'icon', serveJson);
+    if (url === '/dock') return plugins.dispatch('launcher', req, res, 'status', serveJson);
     if (url === '/arc-fix') return arcFix.status().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
     if (url === '/home-order') return homeOrder.read().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
+    if (url === '/restore') return handleRestore(req,res);
     if (url === '/wins') return wins.read().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
     if (url === '/icon.png') return serveIcon(res);
     if (url === '/hbbtv') return hbbtv.read().then(function(d){serveJson(res,d);}).catch(function(e){serveJson(res,{error:e.message},503);});
     if (url === '/privacy') return privacy.read().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
-    if (url === '/tv-menu') { var q=/[?&]id=([^&]+)/.exec(req.url||''), menuId=null; try { if(q)menuId=decodeURIComponent(q[1]); } catch(e) { return serveJson(res,{error:'Invalid menu ID'},400); } return (q?menuSettings.read(menuId):menuSettings.load()).then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)}); }
-    if (url === '/monitor') { var scope=/[?&]scope=([^&]*)/.exec(req.url||'');if(scope&&!/^(summary|full)$/.test(scope[1]))return serveJson(res,{error:'Unsupported monitor scope'},400);return monitor.snapshot(scope?scope[1]:'full').then(function(d){d.telemetry=readTelemetry();serveJson(res,d);}).catch(function(e){serveJson(res,{error:e.message},503);}); }
+    if (url === '/tv-menu') { var q=MENU_ID_QUERY_RE.exec(req.url||''), menuId=null; try { if(q)menuId=decodeURIComponent(q[1]); } catch(e) { return serveJson(res,{error:'Invalid menu ID'},400); } return (q?menuSettings.read(menuId):menuSettings.load()).then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)}); }
+    if (url === '/monitor') { var scope=SCOPE_QUERY_RE.exec(req.url||'');if(scope&&!MONITOR_SCOPE_RE.test(scope[1]))return serveJson(res,{error:'Unsupported monitor scope'},400);return monitor.snapshot(scope?scope[1]:'full').then(function(d){d.telemetry=readTelemetry();serveJson(res,d);}).catch(function(e){serveJson(res,{error:e.message},503);}); }
     if (url === '/startup') return Promise.all([inventory(false),monitor.startup().catch(function(e){return {error:e.message};})]).then(function(d){serveJson(res,{apps:d[0].apps,services:Array.isArray(d[1])?d[1]:[],serviceError:d[1].error||null});});
     if (url === '/telemetry') return serveJson(res, readTelemetry());
     if (url === '/leftovers') return handleLeftovers(req,res);
     if (url === '/status') return serveJson(res, Object.assign({}, platform.status(), {app: buildInfo}));
+    if (url === '/update') return serveJson(res, updater.status());
     if (url === '/screen') return screenSummary().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
     if (url === '/exec') return handleExecStatus(res);
     if (url === '/debloat') return handleDebloatList(req, res);
@@ -650,18 +748,16 @@ http.createServer(function (req, res) {
     if (url === '/tv-settings') return Promise.all([tvSettings.read().catch(function(e){return {items:[],error:e.message}}),dnsFilter.status().catch(function(e){return {error:e.message}}),tvSettings.readNetwork().catch(function(e){return {configurationError:e.message,services:[],interfaces:[],writable:false}}),arcFix.status().catch(function(e){return {error:e.message}})]).then(function(d){serveJson(res,{ts:Date.now(),items:d[0].items,scope:d[0].scope,error:d[0].error||null,network:Object.assign({},d[1],d[2]),arcFix:d[3],device:settings.sanitize(state.settings)});});
     if (url === '/settings') return handleSettings(req, res);
     if (url === '/remap') return handleRemap(req, res);
-    if (url === '/' || url === '/index.html') return serveHtml(res, dashboardHtml());
+    if (url === '/' || url === '/index.html') return serveHtml(res, auth.decorate(dashboardHtml()));
     serveJson(res, { error: 'not found' }, 404);
 }).listen(PORT, function () {
     console.log('VETRO listening on ' + PORT);
 });
 
 platform.start();
-// The dock is started again after a boot or a crash while its switch is on.
-// A short tick notices the moment the root agent connects, so after a boot the dock starts at once
-// instead of waiting for the next 10 s round.
-var dockAgentWas=false,dockTicks=0;
-var dockTimer=setInterval(function(){var up=!!platform.status().agent.connected,edge=up&&!dockAgentWas;dockAgentWas=up;if(edge||++dockTicks>=5){dockTicks=0;dock.supervise(up).catch(function(){});arcFix.supervise(up).catch(function(){});}},2000);if(dockTimer.unref)dockTimer.unref();
+// The launcher is started again after a boot or a crash while its switch is on: that supervision is the launcher plugin's (plugin-launcher.js).
+var arcAgentWas=false,arcTicks=0;
+var arcTimer=setInterval(function(){var up=!!platform.status().agent.connected,edge=up&&!arcAgentWas;arcAgentWas=up;if(edge||++arcTicks>=5){arcTicks=0;arcFix.supervise(up).catch(function(){});}},2000);if(arcTimer.unref)arcTimer.unref();
 // Retry after boot and helper disconnects, including late adapter availability.
 var inputRestoreTimer=setInterval(restoreInput,5000);if(inputRestoreTimer.unref)inputRestoreTimer.unref();
 
@@ -676,6 +772,43 @@ var bridge = new MqttBridge(readTelemetry,function(m){
 });
 bridge.setTopics(remapStore.rules.filter(function(r){return r.enabled&&r.trigger.type==='mqtt'}).map(function(r){return r.trigger.value}));
 bridge.start();
+// Self-update (docs/UPDATING.md): a bundle signed with the Vetro release key replaces the package files in place.
+// Nothing is checked or downloaded here; the dashboard fetches the bundle in the browser and sends it to /update/apply.
+var updater = new Updater({publicKey: require('./update-key.js'), installDir: path.resolve(__dirname, '..'),
+    workDir: process.env.VETRO_UPDATE_DIR || '/opt/usr/home/owner/share/vetro-update', buildInfo: buildInfo, execute: agentExecute, dockStopCommand: dock.stopLines(),
+    source: process.env.VETRO_UPDATE_SOURCE || 'https://raw.githubusercontent.com/andrearicci93/vetro/updates/'});
+// Once the root agent has connected, a freshly updated version restarts the launcher if the update changed its files,
+// then tells the watchdog it is up (otherwise the old version comes back). The dock is a separate process: a service
+// restart alone leaves it running the old binary.
+function restartDockAfterUpdate() {
+    if (!dock.readState().enabled) return Promise.resolve('off');
+    var tries = 0;
+    function attempt() {
+        return dock.refresh().then(function () { return 'restarted'; }, function (e) {
+            if (++tries >= 4) throw e;
+            return new Promise(function (r) { setTimeout(r, 4000); }).then(attempt);
+        });
+    }
+    return attempt();
+}
+var updateConfirmAttempts = 0;
+var updateConfirmTimer = setInterval(function () {
+    if (++updateConfirmAttempts > 60) { clearInterval(updateConfirmTimer); return; }
+    if (!platform.status().agent.connected) return;
+    clearInterval(updateConfirmTimer);
+    updater.finish(restartDockAfterUpdate).catch(function () { /* the watchdog decides */ });
+}, 5000);
+if (updateConfirmTimer.unref) updateConfirmTimer.unref();
+// Third-party plugins (see docs/plugins.md): loaded from the plugin folder, off until switched on, guarded, safe mode after a failed boot.
+// Bundled plugins ship in this package, are on by default, keep running in safe mode and get ctx.vetro (docs/PLUGIN-ARCHITECTURE.md).
+// The launcher is the first one; MQTT, the remapper and the rest are still Vetro's own code.
+var plugins = new PluginHost({registryKey: require('./plugin-key.js'), dir: process.env.VETRO_PLUGIN_DIR || '/opt/usr/home/owner/share/vetro-plugins', execute: agentExecute,
+    registry: process.env.VETRO_PLUGIN_REGISTRY || 'https://raw.githubusercontent.com/andrearicci93/vetro-plugins/main/index.json',
+    services: {agentConnected: function () { return platform.status().agent.connected; }, json: serveJson, readJson: readJsonBody}});
+plugins.register(require('./plugin-launcher.js').definition(dock));
+plugins.start();
+// A deliberate stop is not a crash: close the boot marker so the next start is not put in safe mode.
+['SIGTERM', 'SIGINT'].forEach(function (sig) { process.on(sig, function () { try { plugins.stop(); } catch (e) { /* exiting anyway */ } process.exit(0); }); });
 
 // Foreground app for MQTT: read-only, one small status query every 5 seconds,
 // only while a broker connection is up. Names come from the stored probe.

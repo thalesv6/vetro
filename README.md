@@ -43,8 +43,9 @@ Samsung TVs ship with advertising, viewing-data collection, voice assistants and
 **Quick settings** has one switch per win:
 
 - **Disable all advertising and tracking**, which includes the ACR viewing-data services.
-- **Block ad and tracking domains** with a filter on the TV itself, keeping your DNS servers.
-- **Disable HbbTV** and **MultiScreen autostart**, which free about 22 MB and 15 MB of RAM.
+- **Enable domain blocking** with a filter on the TV itself, keeping your DNS servers.
+- **Stop viewing-data collection**, which stops the services that recognise what is on screen, log remote key presses and send usage logs, now and after every restart.
+- **Disable HbbTV**, **Multi View autostart** and **Stop Ambient**, which free about 22 MB, 15 MB and 59 MB of RAM.
 - **Disable all voice assistants**, or Alexa, Google Assistant, Bixby and the other voice services one by one.
 - **Disable automatic firmware update**, so a new firmware does not remove root behind your back.
 
@@ -59,6 +60,8 @@ Each switch shows *Done* or *Partly done*, so you can see what actually changed.
 
 Quick settings and Task manager share the same inventory: disable an assistant in one and its components show up as disabled in the other. Disabling a component keeps it installed and can be reversed; stopping ends the running process; uninstalling needs an installer to recover. Descriptions come from the Q80A's firmware, so on other models some packages are unclassified and left alone.
 
+**Uninstalling:** *Quick settings, Maintenance, Restore the TV* shows what Vetro changed and puts it all back after one confirmation; *Remove Vetro* can then delete Vetro's saved data and explains how to delete the app (from the TV's Apps screen, or with Apps2Samsung). [Steps →](app/docs/INSTALLATION.md#uninstalling)
+
 ## Remapper
 
 Do what you want with the remote. Press a button, choose an app, and the button opens it. Shortcuts survive restarts, and a key can also trigger an MQTT message for Home Assistant.
@@ -72,6 +75,8 @@ Do what you want with the remote. Press a button, choose an app, and the button 
 - **TV settings:** adjust supported picture controls and selected advanced settings, with read-back and restore.
 - **MQTT and Home Assistant:** publish the TV's state and discovery and trigger actions from exact topics. [Setup guide](app/docs/mqtt/README.md).
 - **Dashboard:** CPU, RAM, swap, storage and processes. Live sampling starts when you ask and stops after two minutes.
+- **Plugins:** add-ons written by other people, installed from a public list or a file, off until you switch them on. They are third-party code, not sandboxed (a plugin can do what Vetro can, including running commands as root) and only spot-checked: read the warning in [the plugin guide](app/docs/plugins.md), which also explains how to write and publish one.
+- **Updates:** update Vetro from the dashboard, launcher included, with no computer and no reinstall. Updates are signed and put back by themselves if the new version does not start. [How it works](app/docs/UPDATING.md).
 - **Diagnostics:** download a redacted report to share in an issue. [Report format](app/docs/DIAGNOSTIC-EXPORT.md).
 
 ## Install
@@ -86,7 +91,7 @@ Whichever way you choose, finish with the same two steps: **open Vetro once** on
 
 The root comes from [Chris Ritsen's Samsung TV root research](https://github.com/chris-ritsen/samsung-tv-root) and works through TV-local SDB, so no computer needs to stay connected. Startup can take up to 90 seconds. This is experimental software: privileged changes can disrupt TV features, so read what a switch does before turning it on.
 
-**The dashboard uses plain HTTP and has no login.** Anyone on your network can open it, so keep the TV on a trusted LAN and never expose it to the Internet. [Integration details](rooting/README.md) · [Validation record](app/docs/RELEASE-AUDIT.md)
+**The dashboard and API answer only paired devices:** a browser or script pairs once with a 6-digit code shown on the TV ([sign-in](app/docs/SIGN-IN.md)). Traffic is still plain HTTP, so keep the TV on a trusted LAN and never expose it to the Internet. [Integration details](rooting/README.md) · [Validation record](app/docs/RELEASE-AUDIT.md)
 
 ## Compatibility
 

@@ -7,9 +7,23 @@ var sdb = require('./sdb.js');
 var tarGz = require('./tar.js').tarGz;
 var RootAgentServer = require('./root-agent.js').RootAgentServer;
 var TunnelServer = require('./sdb-tunnel.js').TunnelServer;
+var SDB_TUNNEL_PORT = 26201;
+var SDB_TUNNEL_PORT_ERROR = null;
+(function () {
+    // Node 4.4 has no Number.isInteger. Reject out-of-range or non-integer
+    // values instead of silently falling back to the default port.
+    var raw = process.env.VETRO_SDB_TUNNEL_PORT;
+    if (raw === undefined || raw === '') return;
+    var n = Number(raw);
+    if (!isFinite(n) || Math.floor(n) !== n || n < 1 || n > 65535) {
+        SDB_TUNNEL_PORT_ERROR = 'invalid VETRO_SDB_TUNNEL_PORT: ' + raw;
+        return;
+    }
+    SDB_TUNNEL_PORT = n;
+})();
+var tunnelServer = null;
 var debloatCommands = require('./debloat-commands.js');
 var STAGE = '/home/owner/share/tmp/sdk_tools';
-var SDB_TUNNEL_PORT = Number(process.env.VETRO_SDB_TUNNEL_PORT) || 26201;
 
 var state = {
     when: new Date().toISOString(),
@@ -18,6 +32,8 @@ var state = {
     prepared: false,
     running: false,
     unsupported: false,
+    rooting: { backend: 'sdb-archive', phase: 'stopped', failure: null },
+    sdbTunnel: { listening: false },
     agent: { connected: false }
 };
 
@@ -166,7 +182,6 @@ var secret = crypto.randomBytes(32);
 var secretB64 = secret.toString('base64');
 var agentServer = null;
 var agentConnected = false;
-var tunnelServer = null;
 var launchClient = null;   // temporary SDB connection during launch
 var launching = false;
 var relaunchTimer = null;
@@ -183,7 +198,9 @@ function prepareForRuntime(port) {
         delete state.prepareError;
     } catch (e) {
         state.prepareError = String(e.message || e);
+        rootFailure('preparation', e.code === 'platformUnsupported' ? 'platformUnsupported' : 'prepare-failed');
         if (e.code !== 'platformUnsupported') return;
+        rootPhase('unsupported');
         // This runtime will never be able to prepare the agent, so stop the
         // retry loop (which rewrote the status file every few seconds) and the
         // loopback listener that nothing can connect to.
@@ -195,16 +212,60 @@ function prepareForRuntime(port) {
     }
 }
 
+// Report only phases we can observe. An SDB stream finishing does not prove
+// injection or archive execution succeeded; only authenticated AUTH proves root.
+function rootPhase(phase) { state.rooting.phase = phase; }
+function rootFailure(stage, code) {
+    state.rooting.failure = { stage: stage, code: code };
+}
+function transportCode(error) {
+    var codes = ['sdbRefused', 'sdbTimeout', 'sdbReset', 'sdbAuthRequired', 'sdbError',
+        'sdbClosed', 'sdbStreamFailed', 'sdbStreamError'];
+    return error && codes.indexOf(error.code) >= 0 ? error.code : 'sdbError';
+}
+
+// sdbd accepts a single host connection. When the tunnel is listening it owns
+// that connection and multiplexes every client, so Vetro must go through it too
+// instead of opening a competing direct connection to 26101.
+function sdbTarget() {
+    var tunnel = state.sdbTunnel;
+    if (tunnel && tunnel.listening && tunnel.port) {
+        return { host: '127.0.0.1', port: tunnel.port, timeout: 8000 };
+    }
+    return { host: '127.0.0.1', port: 26101, timeout: 8000 };
+}
+
+function startTunnel(cb) {
+    if (SDB_TUNNEL_PORT_ERROR) {
+        state.sdbTunnel = { listening: false, error: SDB_TUNNEL_PORT_ERROR };
+        cb();
+        return;
+    }
+    var server = new TunnelServer({ port: SDB_TUNNEL_PORT });
+    tunnelServer = server;
+    server.start(function (err, port) {
+        // A stop() during startup replaced the server: do not resume launching.
+        if (tunnelServer !== server) { if (!err) server.close(); return; }
+        state.sdbTunnel = err
+            ? { listening: false, error: String(err.message || err) }
+            : { listening: true, port: port };
+        cb();
+    });
+}
+
 function startAgent() {
     if (state.running) return;
     state.running = true;
     state.unsupported = false;
+    state.rooting = { backend: 'sdb-archive', phase: 'preparing', failure: null };
     agentServer = new RootAgentServer({
         secret: secret,
         onConnect: function (conn) {
             if (!state.running) { conn._socket.destroy(); return; }
             if (relaunchTimer) { clearTimeout(relaunchTimer); relaunchTimer = null; }
             agentConnected = true;
+            rootPhase('connected');
+            state.rooting.failure = null;
             state.agent = {
                 connected: true,
                 pid: conn.identity.pid,
@@ -220,31 +281,30 @@ function startAgent() {
             if (launchClient) { try { sdb.close(launchClient); } catch (e) {} launchClient = null; }
         },
         onClose: function () {
+            if (!state.running) return;
             agentConnected = false;
             state.agent = { connected: false };
+            rootFailure('agent-connection', 'agent-disconnected');
             if (launchClient) { try { sdb.close(launchClient); } catch (e) {} launchClient = null; }
             persist();
             scheduleRelaunch();
         }
     });
 
-    agentServer.start(function (port) {
-        if (!state.running) return;
-        state.agentPort = port;
-        prepareForRuntime(port);
-        relaunch();
-    });
-
-    tunnelServer = new TunnelServer({ port: SDB_TUNNEL_PORT });
-    tunnelServer.start(function (err, port) {
-        state.sdbTunnel = err
-            ? { listening: false, error: String(err.message || err) }
-            : { listening: true, port: port };
+    startTunnel(function () {
+        if (!state.running || !agentServer) return;
+        agentServer.start(function (port) {
+            if (!state.running) return;
+            state.agentPort = port;
+            prepareForRuntime(port);
+            relaunch();
+        });
     });
 }
 
 function scheduleRelaunch() {
     if (!state.running || state.unsupported || relaunchTimer) return;
+    rootPhase('retrying');
     relaunchTimer = setTimeout(function () {
         relaunchTimer = null;
         relaunch();
@@ -254,6 +314,7 @@ function scheduleRelaunch() {
 function relaunch() {
     if (launching || agentConnected || !agentServer || !state.running || state.unsupported) return;
     launching = true;
+    rootPhase('preparing');
     var gen = ++launchGen;
 
     // kill any previous hanging injection before starting a new one, so two
@@ -281,6 +342,7 @@ function relaunch() {
     } catch (e) {
         launching = false;
         state.prepareError = String(e.message || e);
+        rootFailure('preparation', 'token-write-failed');
         persist();
         scheduleRelaunch();
         return;
@@ -292,28 +354,51 @@ function relaunch() {
     var entry = { t: Date.now(), phase: 'launch' };
     pushAttempt(entry);
 
-    sdb.connect({ host: '127.0.0.1', port: 26101, timeout: 8000 })
+    rootPhase('sdb-handshake');
+    sdb.connect(sdbTarget())
         .then(function (client) {
-            if (!state.running || gen !== launchGen) { sdb.close(client); launching = false; return; }
+            if (!state.running || gen !== launchGen || agentConnected) {
+                sdb.close(client);
+                if (gen === launchGen) launching = false;
+                return;
+            }
             launchClient = client;
             entry.connect = 'ok';
+            rootPhase('launch-command');
             // The launch script returns independently of the agent lifetime.
             // Release this connection on agent connect as an additional safeguard.
-            sdb.exec(client, 'shell:0 appinstall tpk ' + injection, { timeout: 60000 })
-                .then(function (out) { entry.output = out; })
-                .catch(function (e) { entry.err = String(e.message || e); });
+            Promise.resolve().then(function () {
+                if (!state.running || gen !== launchGen || agentConnected) return;
+                return sdb.exec(client, 'shell:0 appinstall tpk ' + injection, { timeout: 60000 });
+            }).then(function (out) {
+                entry.output = out;
+                if (state.running && gen === launchGen && !agentConnected) rootPhase('agent-callback');
+            }).catch(function (e) {
+                entry.err = String(e.message || e);
+                if (state.running && gen === launchGen && !agentConnected) {
+                    rootFailure('launch-command', transportCode(e));
+                    rootPhase('agent-callback');
+                    persist();
+                }
+            });
             launching = false;
             // if the agent has not connected within 30s, retry — but only if
             // this launch is still the current one (no newer relaunch started)
             setTimeout(function () {
-                if (gen === launchGen && !agentConnected && !launching) relaunch();
+                if (state.running && gen === launchGen && !agentConnected && !launching) {
+                    // Keep a more specific error from this launch when available.
+                    if (!entry.err) rootFailure('agent-callback', 'agent-timeout');
+                    relaunch();
+                }
             }, 30000);
         })
         .catch(function (e) {
+            if (!state.running || gen !== launchGen) return;
             launching = false;
             launchClient = null;
             entry.connect = 'fail:' + (e.code || 'error');
             entry.err = String(e.message || e);
+            rootFailure('sdb-handshake', transportCode(e));
             persist();
             scheduleRelaunch();
         });
@@ -338,6 +423,7 @@ function status() {
 }
 function stop() {
     state.running = false;
+    rootPhase('stopped');
     ++launchGen;
     if (relaunchTimer) clearTimeout(relaunchTimer);
     relaunchTimer = null;
@@ -357,7 +443,7 @@ function install(packageId, wgtPath) {
         return Promise.reject(new Error('invalid package ID or WGT path'));
     }
     var dispatched = false;
-    return sdb.connect({host: '127.0.0.1', port: 26101, timeout: 8000}).then(function (client) {
+    return sdb.connect(sdbTarget()).then(function (client) {
         dispatched = true;
         return sdb.exec(client, 'shell:0 vd_appinstall ' + packageId + ' ' + wgtPath, {timeout: 120000})
             .finally(function () {sdb.close(client);});

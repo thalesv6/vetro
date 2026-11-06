@@ -14,6 +14,15 @@ var fs = require('fs');
 var os = require('os');
 var path = require('path');
 var catalog = require('./dock-catalog.js');
+// Regular expressions compiled once at module load, not on every call.
+var QUOTE_RE = /'/g;
+var AUTORUN_VALUE_RE = /value = (\d+)/;
+var PROBE_DOCK_RE = /^dock=(\d+)$/m;
+var PROBE_HOME_RE = /^home=(\d)$/m;
+var TARGET_SYSTEM_RE = /^(?:sys|key|panel):/;
+var TARGET_PANEL_RE = /^panel:/;
+var TARGET_SOURCE_RE = /^source:/;
+var SLUG_RE = /^[a-z0-9_-]{1,40}$/;
 
 var SHARE = '/opt/usr/home/owner/share';
 var STATE_FILE = SHARE + '/vetro-dock.json';
@@ -25,6 +34,9 @@ var LOG_FILE = RUN_DIR + '/tvlauncher.log';
 var DLL = 'tvlauncher-dotnet.dll';
 var UNIT = 'vetro-dock';                              // the dock's own systemd unit
 var HOME_APP = 'com.samsung.tv.csfs';
+// 2025 (RSM/CoBA) firmware runs the sidebar and media rows as separate processes that stay on top of the dock
+// when only csfs is closed, so the guard and the enable-time kill target all three.
+var HOME_KILL = [HOME_APP, 'com.samsung.tv.home.sidebar', 'com.samsung.tv.home.media'];
 var AUTORUN_KEY = 'db/menu/smart_hub/ontvsetting/auto_start';   // Samsung's "Autorun Smart Hub"
 var HOME_CODE = 63;                                   // Home on the forwarded remote Vetro creates
 var START_WAIT_MS = 15000;
@@ -34,7 +46,7 @@ var RETRY_FIRST_MS = 30000;
 var RETRY_MAX_MS = 300000;
 
 function wrap(s) { return 'echo ' + Buffer.from(s).toString('base64') + ' | base64 -d | sh'; }
-function q(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+function q(s) { return "'" + String(s).replace(QUOTE_RE, "'\\''") + "'"; }
 
 function Dock(options) {
     options = options || {};
@@ -62,8 +74,8 @@ Dock.prototype.readState = function () {
     try {
         var s = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'));
         return {enabled: s && s.enabled === true, since: typeof s.since === 'number' ? s.since : null, fixTizenTube: s && s.fixTizenTube === true,
-            autorunWas: s && s.autorunWas === 1 ? 1 : null};
-    } catch (e) { return {enabled: false, since: null, fixTizenTube: false, autorunWas: null}; }
+            noMotion: s && s.noMotion === true, autorunWas: s && s.autorunWas === 1 ? 1 : null};
+    } catch (e) { return {enabled: false, since: null, fixTizenTube: false, noMotion: false, autorunWas: null}; }
 };
 
 // Change some fields of the saved state and keep the rest.
@@ -76,7 +88,7 @@ Dock.prototype.patchState = function (patch) {
 // turning the launcher off puts it back. Only a change made here is ever undone here.
 Dock.prototype.readAutorun = function () {
     return this.execute(wrap('vconftool get ' + AUTORUN_KEY + ' 2>&1'), 6000).then(function (r) {
-        var m = /value = (\d+)/.exec(check(r, 'Autorun read'));
+        var m = AUTORUN_VALUE_RE.exec(check(r, 'Autorun read'));
         if (!m) throw new Error('Autorun Smart Hub could not be read');
         return +m[1];
     });
@@ -120,11 +132,13 @@ Dock.prototype.probe = function () {
         'p=$(cat ' + PID_FILE + ' 2>/dev/null)',
         'if [ -n "$p" ] && tr "\\0" " " < /proc/$p/cmdline 2>/dev/null | grep -q ' + DLL + '; then echo "dock=$p"; else echo "dock="; fi',
         'if pidof ' + HOME_APP + ' >/dev/null 2>&1 || ps | grep -q "[c]sfs"; then echo "home=1"; else echo "home=0"; fi',
-        'echo "log:"; tail -n 6 ' + LOG_FILE + ' 2>/dev/null'
+        // No log file yet is normal. Without || true the missing file failed the whole read, and the user saw its raw
+        // output, "dock= home=0 log:", as the error (#82).
+        'echo "log:"; tail -n 6 ' + LOG_FILE + ' 2>/dev/null || true'
     ].join('\n');
     return this.execute(wrap(script), 8000).then(function (r) {
         var out = check(r, 'Status');
-        var pid = /^dock=(\d+)$/m.exec(out), home = /^home=(\d)$/m.exec(out);
+        var pid = PROBE_DOCK_RE.exec(out), home = PROBE_HOME_RE.exec(out);
         return {running: !!pid, pid: pid ? +pid[1] : null, samsungHome: home ? home[1] === '1' : null,
             log: out.split('log:\n')[1] ? out.split('log:\n')[1].trim() : ''};
     });
@@ -148,7 +162,7 @@ Dock.prototype.status = function (options) {
 Dock.prototype.statusNow = function () {
     var self = this, state = this.readState();
     var base = {installed: this.installed(), enabled: state.enabled, since: state.since, busy: this.busy,
-        error: this.lastError, failures: this.failures, apps: this.lastCatalog, fixTizenTube: state.fixTizenTube, autorunSwitchedOff: state.autorunWas === 1,
+        error: this.lastError, failures: this.failures, apps: this.lastCatalog, fixTizenTube: state.fixTizenTube, noMotion: state.noMotion, autorunSwitchedOff: state.autorunWas === 1,
         entries: this.entries(), inputs: this.inputEntries()};
     return this.probe().then(function (p) {
         return Object.assign(base, {running: p.running, pid: p.pid, samsungHome: p.samsungHome, log: p.log});
@@ -167,7 +181,7 @@ Dock.prototype.statusNow = function () {
 Dock.prototype.startScript = function () {
     var env = 'HOME=/home/owner XDG_RUNTIME_DIR=/run WAYLAND_DISPLAY=wayland-0 TVLAUNCHER_ENGINE=egl TVLAUNCHER_DIR=' + RUN_DIR;
     var args = DLL + ' --apps ' + q(this.appsFile) + ' --inputs ' + q(path.join(this.dir, 'res', 'inputs.tsv')) +
-        ' --hidden --home-code ' + HOME_CODE + ' --kill-on-home ' + HOME_APP;
+        ' --hidden --home-code ' + HOME_CODE + ' --kill-on-home ' + HOME_KILL.join(',') + (this.readState().noMotion ? ' --no-motion' : '');
     return [
         this.stopLines(),
         'rm -f ' + FIFO,
@@ -250,7 +264,7 @@ Dock.prototype.enable = function () {
     }).then(function () {
         // Samsung's Home is idle in the background; closing it frees its memory, and Settings or
         // Source opened from the dock start it again on demand.
-        return self.execute('app_launcher -k ' + HOME_APP, 8000).catch(function () {});
+        return self.execute(HOME_KILL.map(function (id) { return 'app_launcher -k ' + id; }).join('; '), 8000).catch(function () {});
     }).then(function () { return self.status(); }).catch(function (e) {
         self.lastError = e.message;
         return self.stopDock().catch(function () {}).then(function () { throw e; });
@@ -290,8 +304,8 @@ function parseTsv(text) {
     return String(text || '').split('\n').filter(function (l) { return l.trim() && l.trim()[0] !== '#'; }).map(function (l) {
         var f = l.split('\t'), target = f[2] || '';
         return {slug: f[0], label: f[1], appId: target, icon: f[4] || null, killFirst: f[5] || null,
-            system: /^(?:sys|key|panel):/.test(target), panel: /^panel:/.test(target), source: /^source:/.test(target) ? +target.slice(7) : null};
-    }).filter(function (e) { return /^[a-z0-9_-]{1,40}$/.test(e.slug || '') && e.label; });
+            system: TARGET_SYSTEM_RE.test(target), panel: TARGET_PANEL_RE.test(target), source: TARGET_SOURCE_RE.test(target) ? +target.slice(7) : null};
+    }).filter(function (e) { return SLUG_RE.test(e.slug || '') && e.label; });
 }
 Dock.prototype.entries = function () {
     try { return parseTsv(fs.readFileSync(this.appsFile, 'utf8')); } catch (e) { return []; }
@@ -315,10 +329,26 @@ Dock.prototype.setFixTizenTube = function (on) {
     });
 };
 
+// Still selection: the focus jumps between tiles and the icons keep their size (the dock's --no-motion).
+// It is a start argument, so a running dock is restarted.
+Dock.prototype.setNoMotion = function (on) {
+    var self = this;
+    if (typeof on !== 'boolean') return Promise.reject(new Error('Invalid value'));
+    if (this.busy) return Promise.reject(new Error('Another launcher change is in progress'));
+    var state = this.readState();
+    try { this.patchState({noMotion: on}); }
+    catch (e) { return Promise.reject(e); }
+    if (!state.enabled) return this.status();
+    return this.refresh().catch(function (e) {
+        try { self.patchState({noMotion: state.noMotion}); } catch (e2) {}
+        throw e;
+    });
+};
+
 // The file behind one tile of the preview: the app's own icon when the list names one that is a
 // safe path, else the dock's packaged icon. Returns a Buffer or null.
 Dock.prototype.iconFile = function (slug) {
-    if (!/^[a-z0-9_-]{1,40}$/.test(String(slug))) return null;
+    if (!SLUG_RE.test(String(slug))) return null;
     var all = this.entries().concat(this.inputEntries()), entry = all.filter(function (e) { return e.slug === slug; })[0];
     if (!entry) return null;
     var files = [];
