@@ -50,7 +50,6 @@ var ComponentActions = require('./component-actions.js');
 var dnsFilter = new (require('./local-dns.js').Filter)(agentExecute);
 var homeOrder = new (require('./home-order.js').Order)(agentExecute);
 var dock = new (require('./dock.js').Dock)({execute: agentExecute});
-var arcFix = new (require('./arc-fix.js').ArcFix)({execute: agentExecute});
 var hbbtv = new (require('./hbbtv.js').Control)(agentExecute);
 var wins = new (require('./quick-wins.js').Wins)(agentExecute, {dns: dnsFilter});
 var presence = new (require('./presence.js').Presence)(agentExecute);
@@ -701,7 +700,6 @@ http.createServer(function (req, res) {
         if (url === '/restore') return handleRestore(req,res);
         if (url === '/hbbtv') return readJsonBody(req,res,function(p){hbbtv.change(p.off,p.expected).then(function(d){privacy.cached=null;try{wins.remember('hbbtv',d.off);}catch(e){}serveJson(res,d);}).catch(function(e){serveJson(res,{error:e.message},409);});});
         if (url === '/dock') return plugins.dispatch('launcher', req, res, 'action', serveJson);
-        if (url === '/arc-fix') return readJsonBody(req,res,function(p){var t=p.action==='enable'?arcFix.enable(p):p.action==='disable'?arcFix.disable():p.action==='configure'?arcFix.configure(p):p.action==='trigger'?arcFix.trigger(p):Promise.reject(Error('Invalid ARC action'));t.then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{ok:false,error:e.message},409)});});
         if (url === '/home-order') return readJsonBody(req,res,function(p){var t=p.action==='restore'?homeOrder.restore():homeOrder.write(p.entries);t.then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},409)});});
         if (url === '/tv-menu') return readJsonBody(req,res,function(p){menuSettings.write(p.id,p.value).then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{ok:false,error:e.message},409)});});
         if (url === '/tv-settings') return readJsonBody(req,res,function(p){tvSettings.write(p).then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{ok:false,error:e.message},409)});});
@@ -721,7 +719,6 @@ http.createServer(function (req, res) {
     if (url === '/dns') return dnsFilter.status().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
     if (url === '/dock/icon') return plugins.dispatch('launcher', req, res, 'icon', serveJson);
     if (url === '/dock') return plugins.dispatch('launcher', req, res, 'status', serveJson);
-    if (url === '/arc-fix') return arcFix.status().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
     if (url === '/home-order') return homeOrder.read().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
     if (url === '/restore') return handleRestore(req,res);
     if (url === '/wins') return wins.read().then(function(d){serveJson(res,d)}).catch(function(e){serveJson(res,{error:e.message},503)});
@@ -745,7 +742,7 @@ http.createServer(function (req, res) {
     if (url === '/apps/icon') return handleIcon(req,res);
     if (url === '/apps') return handleApps(req, res);
     if (url === '/blocklist') return handleBlocklist(req, res);
-    if (url === '/tv-settings') return Promise.all([tvSettings.read().catch(function(e){return {items:[],error:e.message}}),dnsFilter.status().catch(function(e){return {error:e.message}}),tvSettings.readNetwork().catch(function(e){return {configurationError:e.message,services:[],interfaces:[],writable:false}}),arcFix.status().catch(function(e){return {error:e.message}})]).then(function(d){serveJson(res,{ts:Date.now(),items:d[0].items,scope:d[0].scope,error:d[0].error||null,network:Object.assign({},d[1],d[2]),arcFix:d[3],device:settings.sanitize(state.settings)});});
+    if (url === '/tv-settings') return Promise.all([tvSettings.read().catch(function(e){return {items:[],error:e.message}}),dnsFilter.status().catch(function(e){return {error:e.message}}),tvSettings.readNetwork().catch(function(e){return {configurationError:e.message,services:[],interfaces:[],writable:false}})]).then(function(d){serveJson(res,{ts:Date.now(),items:d[0].items,scope:d[0].scope,error:d[0].error||null,network:Object.assign({},d[1],d[2]),device:settings.sanitize(state.settings)});});
     if (url === '/settings') return handleSettings(req, res);
     if (url === '/remap') return handleRemap(req, res);
     if (url === '/' || url === '/index.html') return serveHtml(res, auth.decorate(dashboardHtml()));
@@ -756,8 +753,6 @@ http.createServer(function (req, res) {
 
 platform.start();
 // The launcher is started again after a boot or a crash while its switch is on: that supervision is the launcher plugin's (plugin-launcher.js).
-var arcAgentWas=false,arcTicks=0;
-var arcTimer=setInterval(function(){var up=!!platform.status().agent.connected,edge=up&&!arcAgentWas;arcAgentWas=up;if(edge||++arcTicks>=5){arcTicks=0;arcFix.supervise(up).catch(function(){});}},2000);if(arcTimer.unref)arcTimer.unref();
 // Retry after boot and helper disconnects, including late adapter availability.
 var inputRestoreTimer=setInterval(restoreInput,5000);if(inputRestoreTimer.unref)inputRestoreTimer.unref();
 

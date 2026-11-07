@@ -8,12 +8,13 @@
 // Waiting ~3 seconds and calling org.tizen.tv.HdmiCec.SetActiveSource returns the receiver to ARC,
 // forcing its S/PDIF DSP to re-lock onto the AC3/EAC3 bitstream.
 //
-// Disabled by default: nothing runs in the background unless the user switches it on.
+// This is the logic of the "arc-fix" Vetro plugin (API 1). The plugin being switched on is what turns the watcher on:
+// nothing runs in the background unless the user switches the plugin on. Plain ES5, like every module the TV loads.
 
 var fs = require('fs');
 
-var SHARE = '/opt/usr/home/owner/share';
-var STATE_FILE = SHARE + '/vetro-arc-fix.json';
+// Where the built-in version of this feature kept its settings; read once to carry delay and port over.
+var LEGACY_STATE_FILE = '/opt/usr/home/owner/share/vetro-arc-fix.json';
 var RUN_DIR = '/home/owner';
 var PID_FILE = RUN_DIR + '/vetro-arc-fix.pid';
 var SCRIPT_FILE = RUN_DIR + '/vetro-arc-fix.sh';
@@ -32,7 +33,13 @@ var SPDIF_FORMATS = {
     4: 'ES AAC', 5: 'ES DD+', 6: 'MAT', 7: 'MCH PCM'
 };
 
-function wrap(s) { return 'echo ' + Buffer.from(s, 'utf8').toString('base64') + ' | base64 -d | /bin/sh'; }
+function b64(s) { return (typeof Buffer.from === 'function' ? Buffer.from(s, 'utf8') : new Buffer(s, 'utf8')).toString('base64'); }
+function wrap(s) { return 'echo ' + b64(s) + ' | base64 -d | /bin/sh'; }
+
+// promise.finally without relying on the runtime having it
+function settle(promise, fn) {
+    return promise.then(function (v) { fn(); return v; }, function (e) { fn(); throw e; });
+}
 
 function clampDelay(v) {
     var n = Number(v);
@@ -50,11 +57,14 @@ function check(r, what) {
     return r.stdout || '';
 }
 
+// options.execute: ctx.execute. options.store: { get(): object, set(object) } (ctx.config). options.legacyFile: tests.
 function ArcFix(options) {
-    var o = typeof options === 'function' ? {execute: options} : (options || {});
+    var o = options || {};
     this.execute = o.execute;
-    this.stateFile = o.stateFile || STATE_FILE;
+    this.store = o.store || { get: function () { return {}; }, set: function () {} };
+    this.legacyFile = o.legacyFile === undefined ? LEGACY_STATE_FILE : o.legacyFile;
     this.now = o.now || function () { return Date.now(); };
+    this.active = false;          // the plugin is switched on: the watcher should be running
     this.busy = false;
     this.lastError = null;
     this.failures = 0;
@@ -62,21 +72,20 @@ function ArcFix(options) {
 }
 
 ArcFix.prototype.readState = function () {
-    try {
-        var d = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'));
-        return {
-            enabled: d && d.enabled === true,
-            delaySeconds: clampDelay(d && d.delaySeconds),
-            port: validPort(d && d.port),
-            since: d && Number.isFinite(d.since) ? d.since : null
-        };
-    } catch (e) {
-        return {enabled: false, delaySeconds: 3, port: null, since: null};
+    var d = null;
+    try { d = this.store.get(); } catch (e) { d = null; }
+    if ((!d || d.delaySeconds === undefined && d.port === undefined) && this.legacyFile) {
+        try { d = JSON.parse(fs.readFileSync(this.legacyFile, 'utf8')); } catch (e) { /* nothing to carry over */ }
     }
+    return {
+        delaySeconds: clampDelay(d && d.delaySeconds),
+        port: validPort(d && d.port),
+        since: d && isFinite(d.since) && d.since !== null ? d.since : null
+    };
 };
 
 ArcFix.prototype.writeState = function (state) {
-    try { fs.writeFileSync(this.stateFile, JSON.stringify(state)); }
+    try { this.store.set(state); }
     catch (e) { throw new Error('The ARC fix setting could not be saved: ' + e.message); }
 };
 
@@ -150,7 +159,7 @@ ArcFix.prototype.probe = function () {
 ArcFix.prototype.status = function () {
     var self = this, state = this.readState();
     var base = {
-        enabled: state.enabled,
+        enabled: this.active,
         delaySeconds: state.delaySeconds,
         port: state.port,
         since: state.since,
@@ -232,7 +241,7 @@ ArcFix.prototype.stopLines = function () {
 };
 
 ArcFix.prototype.startScript = function (state) {
-    var daemonB64 = Buffer.from(this.daemonFileContent(state.delaySeconds, state.port), 'utf8').toString('base64');
+    var daemonB64 = b64(this.daemonFileContent(state.delaySeconds, state.port));
     var runner = '/bin/sh -c \'eval "$(cat ' + SCRIPT_FILE + ')"\'';
     return [
         this.stopLines(),
@@ -256,35 +265,28 @@ ArcFix.prototype.launch = function () {
     });
 };
 
-ArcFix.prototype.enable = function (options) {
+// The plugin was switched on: start the background watcher.
+ArcFix.prototype.begin = function () {
     var self = this;
+    this.active = true;
     if (this.busy) return Promise.reject(new Error('Another ARC receiver action is in progress'));
     this.busy = true; this.lastError = null;
-    var cur = this.readState();
-    var nextDelay = options && options.delaySeconds !== undefined ? clampDelay(options.delaySeconds) : cur.delaySeconds;
-    var nextPort = options && options.port !== undefined ? validPort(options.port) : cur.port;
-    try { this.patchState({delaySeconds: nextDelay, port: nextPort}); }
-    catch (e) { this.busy = false; return Promise.reject(e); }
-    return this.launch().then(function () {
-        self.patchState({enabled: true, since: self.now()});
+    return settle(this.launch().then(function () {
+        try { self.patchState({ since: self.now() }); } catch (e) { /* the watcher runs; only the timestamp is lost */ }
         self.failures = 0; self.nextTry = 0;
-        return self.status();
     }).catch(function (e) {
-        self.lastError = e.message;
-        return self.execute(wrap(self.stopLines()), 8000).catch(function () {}).then(function () { throw e; });
-    }).finally(function () { self.busy = false; });
+        self.lastError = e.message;      // supervise() tries again with a growing delay
+        throw e;
+    }), function () { self.busy = false; });
 };
 
-ArcFix.prototype.disable = function () {
+// The plugin was switched off: stop the watcher and remove its script.
+ArcFix.prototype.end = function () {
     var self = this;
-    if (this.busy) return Promise.reject(new Error('Another ARC receiver action is in progress'));
-    this.busy = true; this.lastError = null;
-    try { this.patchState({enabled: false}); }
-    catch (e) { this.busy = false; return Promise.reject(e); }
+    this.active = false;
     return this.execute(wrap(this.stopLines() + '\nrm -f ' + SCRIPT_FILE), 8000).then(function (r) {
         check(r, 'ARC watcher stop');
-        return self.status();
-    }).finally(function () { self.busy = false; });
+    }).catch(function (e) { self.lastError = e.message; });
 };
 
 ArcFix.prototype.configure = function (options) {
@@ -293,13 +295,13 @@ ArcFix.prototype.configure = function (options) {
     var cur = this.readState();
     var delaySeconds = options && options.delaySeconds !== undefined ? clampDelay(options.delaySeconds) : cur.delaySeconds;
     var port = options && options.port !== undefined ? validPort(options.port) : cur.port;
-    try { this.patchState({delaySeconds: delaySeconds, port: port}); }
+    try { this.patchState({ delaySeconds: delaySeconds, port: port }); }
     catch (e) { return Promise.reject(e); }
-    if (!cur.enabled) return this.status();
+    if (!this.active) return this.status();
     this.busy = true; this.lastError = null;
-    return this.launch().then(function () { return self.status(); }).catch(function (e) {
+    return settle(this.launch().then(function () { return self.status(); }).catch(function (e) {
         self.lastError = e.message; throw e;
-    }).finally(function () { self.busy = false; });
+    }), function () { self.busy = false; });
 };
 
 ArcFix.prototype.trigger = function (options) {
@@ -324,7 +326,7 @@ ArcFix.prototype.trigger = function (options) {
         'echo "[$ts2] Manual ARC reset complete on HDMI ${port}" >> ' + LOG_FILE,
         'echo "reset_port=$port"'
     ].join('\n');
-    return this.execute(wrap(script), (delay + 10) * 1000).then(function (r) {
+    var run = this.execute(wrap(script), (delay + 10) * 1000).then(function (r) {
         var out = check(r, 'ARC reset');
         var m = /^reset_port=(\d+)$/m.exec(out);
         var usedPort = m ? +m[1] : (reqPort || 3);
@@ -334,14 +336,17 @@ ArcFix.prototype.trigger = function (options) {
     }).catch(function (e) {
         self.lastError = e.message;
         throw e;
-    }).finally(function () { self.busy = false; });
+    });
+    return settle(run, function () { self.busy = false; });
 };
 
-ArcFix.prototype.supervise = function (agentConnected) {
-    var self = this, state = this.readState();
-    if (!state.enabled || this.busy || !agentConnected || this.now() < this.nextTry) return Promise.resolve(null);
+// Called on a timer while the plugin is on. If the root agent is not connected yet the commands fail and the retry
+// delay grows (15 s, 30 s, ... 3 min), so a TV that is still booting is simply tried again.
+ArcFix.prototype.supervise = function () {
+    var self = this;
+    if (!this.active || this.busy || this.now() < this.nextTry) return Promise.resolve(null);
     this.busy = true;
-    return this.probe().then(function (p) {
+    return settle(this.probe().then(function (p) {
         if (p.running) { self.failures = 0; return 'running'; }
         return self.launch().then(function () { self.failures = 0; self.lastError = null; return 'started'; });
     }).catch(function (e) {
@@ -349,7 +354,7 @@ ArcFix.prototype.supervise = function (agentConnected) {
         self.nextTry = self.now() + Math.min(RETRY_MAX_MS, RETRY_FIRST_MS * Math.pow(2, Math.min(self.failures, 6) - 1));
         self.lastError = e.message;
         return 'failed';
-    }).finally(function () { self.busy = false; });
+    }), function () { self.busy = false; });
 };
 
-module.exports = {ArcFix: ArcFix, STATE_FILE: STATE_FILE, clampDelay: clampDelay, validPort: validPort};
+module.exports = { ArcFix: ArcFix, clampDelay: clampDelay, validPort: validPort };
