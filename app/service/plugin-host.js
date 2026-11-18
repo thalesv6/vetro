@@ -542,7 +542,7 @@ PluginHost.prototype.handle = function (req, res, pathname, json, readBody) {
         if (req.method !== 'GET') json(res, { error: 'Method not allowed' }, 405);
         else {
             var all = this.list();      // once: every status() call counts an error from a plugin whose status() throws
-            json(res, { apiVersion: API_VERSION, safeMode: this.safeMode, dir: this.dir, registry: this.registry,
+            json(res, { apiVersion: API_VERSION, safeMode: this.safeMode, resumePending: this.safeMode && !this._readState().suspended, dir: this.dir, registry: this.registry,
                 signed: !!this.registryKey, developer: this._readState().developer,
                 plugins: all.filter(function (p) { return !p.bundled; }), bundled: all.filter(function (p) { return p.bundled; }) });
         }

@@ -10,6 +10,9 @@ assert.match(html, /function loadPlugins\(\)\{var changed=true;return api\('\/pl
 assert.match(html, /if\(changed\)renderPlugins\(\)/, 'polling repaints only when the list changed');
 assert.match(html, /'\/plugins\/'\+encodeURIComponent\(id\)\+'\/'\+\(on\?'enable':'disable'\)/);
 assert.match(html, /data-plugin-resume/);
+assert.match(html, /data-plugin-safe="paused"/, 'safe mode says plugins are paused and the switches are locked');
+assert.match(html, /data-plugin-safe="resumed"/, 'after Resume the page says a restart is still needed');
+assert.match(html, /Paused by safe mode/, 'a suspended plugin explains itself in its own row');
 assert.match(html, /function installFromRegistry/);
 assert.match(html, /'\/plugins\/install'/);
 assert.match(html, /function renderPluginTabs/);
